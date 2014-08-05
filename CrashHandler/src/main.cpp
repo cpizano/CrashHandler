@@ -74,12 +74,20 @@ class CrashService {
 public:
   CrashService() {
     pipe_ = ::CreateNamedPipe(kPipeName,
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,    
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-        3,
+        1,
         512, 512,
         20,            
         NULL);
+  }
+
+  void Run() {
+    ::ConnectNamedPipe(pipe_, NULL);
+    CrashInfoBlock cib;
+    DWORD read = 0;
+    ::ReadFile(pipe_, &cib, sizeof(cib), &read, NULL);
+    ::Beep(440, 40);
   }
 
   CrashService(const CrashService&) = delete;
@@ -89,9 +97,10 @@ public:
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void DoEvenMoreWork(int x) {
-  Sleep(10);
+#if 0
   if (!x)
     __debugbreak();
+#endif
 }
 
 void DoSomeWork() {
@@ -103,11 +112,16 @@ void DoSomeWork() {
 
 int Client() {
   CrashClient crash_client;
-  DoSomeWork();
+  while (true) {
+    ::Sleep(20);
+    DoSomeWork();
+  }
   return 0;
 }
 
 int Server() {
+  CrashService crash_service;
+  crash_service.Run();
 
   return 0;
 }

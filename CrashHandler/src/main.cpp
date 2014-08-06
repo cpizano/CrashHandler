@@ -116,14 +116,14 @@ public:
     HANDLE event = NULL;
     if (!::DuplicateHandle(::GetCurrentProcess(), events_[event_index_],
                            process, &event,
-                           SYNCHRONIZE, FALSE, 0))
+                           SYNCHRONIZE|EVENT_MODIFY_STATE, FALSE, 0))
       return NULL;
     event_index_++;
     return event;
   }
 
   void OnEvent(size_t index) {
-
+    wprintf(L"event signaled\n");
   }
 
 };
@@ -149,8 +149,8 @@ class CrashService {
 public:
   CrashService() {
     pipe_ = ::CreateNamedPipe(kPipeName,
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        PIPE_ACCESS_DUPLEX|FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_TYPE_MESSAGE|PIPE_READMODE_MESSAGE|PIPE_WAIT,
         1,
         512, 512,
         20,
@@ -163,6 +163,7 @@ public:
       while (true) {
         if (!::ConnectNamedPipe(pipe_, NULL))
           return;
+        wprintf(L"registration intiated\n");
         DWORD read = 0;
         if (!::ReadFile(pipe_, &crb, sizeof(crb), &read, NULL))
           break;
@@ -185,14 +186,16 @@ public:
         client.dump_done = ::CreateEvent(NULL, TRUE, FALSE, NULL);
         if (!::DuplicateHandle(::GetCurrentProcess(), client.dump_done,
                                client.process, &cab.wait_event,
-                               SYNCHRONIZE, FALSE, 0))
+                               SYNCHRONIZE|EVENT_MODIFY_STATE, FALSE, 0))
           break;
         DWORD written = 0;
         if (!::WriteFile(pipe_, &cab, sizeof(cab), &written, NULL))
           break;
+        wprintf(L"client pid=%d registered\n", client.pid);
         clients_.emplace_back(client);
         break;
       }
+      wprintf(L"registration done. %d clients", clients_.size());
       ::DisconnectNamedPipe(pipe_);
     }
   }
@@ -204,10 +207,8 @@ public:
 ///////////////////////////////////////////////////////////////////////////////
 
 void DoEvenMoreWork(int x) {
-#if 1
   if (!x)
     __debugbreak();
-#endif
 }
 
 void DoSomeWork() {
@@ -218,18 +219,19 @@ void DoSomeWork() {
 }
 
 int Client() {
+  wprintf(L"crash client\n");
   CrashClient crash_client;
   while (true) {
-    ::Sleep(20);
+    ::Sleep(10000);
     DoSomeWork();
   }
   return 0;
 }
 
 int Server() {
+  wprintf(L"crash server\n");
   CrashService crash_service;
   crash_service.Run();
-  ::Sleep(200000);
   return 0;
 }
 

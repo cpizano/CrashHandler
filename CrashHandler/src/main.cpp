@@ -84,67 +84,49 @@ CrashClient* CrashClient::global_client = nullptr;
 
 ///////////////////////////////////////////////////////////////////////////////
 
-class EventThread {
-  static const int kEventCount = 60;
-  HANDLE events_[kEventCount];
-  size_t event_index_;
+HANDLE CreateAutoResetEvent() {
+  return ::CreateEvent(NULL, TRUE, FALSE, NULL);
+}
 
-  static DWORD __stdcall WaitRoutine(void* ctx) {
-    EventThread* event_thread = reinterpret_cast<EventThread*>(ctx);
-    while (true) {
-      DWORD wr = ::WaitForMultipleObjectsEx(
-          kEventCount, event_thread->events_, FALSE, INFINITE, TRUE);
-      if (wr < kEventCount)
-        event_thread->OnEvent(wr);
-      else if (wr == WAIT_IO_COMPLETION)
-        break;
-      else
-        __debugbreak();
-    }
-    return 0;
-  }
-
-public:
-  EventThread() : event_index_(0) {
-    for (int ix = 0; ix != kEventCount; ++ix) {
-      events_[ix] = ::CreateEvent(NULL, FALSE, FALSE, NULL);
-    }
-    ::CreateThread(NULL, 0, &WaitRoutine, this, 0, NULL);
-  }
-
-  HANDLE GetEvent(HANDLE process) {
-    HANDLE event = NULL;
-    if (!::DuplicateHandle(::GetCurrentProcess(), events_[event_index_],
-                           process, &event,
-                           SYNCHRONIZE|EVENT_MODIFY_STATE, FALSE, 0))
-      return NULL;
-    event_index_++;
-    return event;
-  }
-
-  void OnEvent(size_t index) {
-    wprintf(L"event signaled\n");
-  }
-
-};
-
+HANDLE DuplicateEvent(HANDLE process, HANDLE event) {
+  HANDLE handle;
+  return ::DuplicateHandle(
+      ::GetCurrentProcess(), event,
+      process, &handle,
+      SYNCHRONIZE|EVENT_MODIFY_STATE, FALSE, 0) ?
+        handle : NULL;
+}
 
 class CrashService {
   HANDLE pipe_;
 
   struct ClientRecord {
+    DWORD pid;
     HANDLE process;
     HANDLE dump_done;
     HANDLE dump_request;
-    DWORD pid;
-
+    HANDLE dump_tpr;
+    HANDLE process_tpr;
+    
     ClientRecord(DWORD pid)
-        : process(NULL), dump_done(NULL), dump_request(NULL), pid(pid) {
+      : pid(pid),
+        process(NULL),
+        dump_done(NULL),
+        dump_request(NULL),
+        dump_tpr(NULL),
+        process_tpr(NULL) {
     }
   };
 
-  EventThread event_thread_;
   std::vector<ClientRecord> clients_;
+
+  static void __stdcall OnDumpEvent(void* ctx, BOOLEAN) {
+
+  }
+
+  static void __stdcall OnProcessEnd(void* ctx, BOOLEAN) {
+
+  }
   
 public:
   CrashService() {
@@ -163,13 +145,16 @@ public:
       while (true) {
         if (!::ConnectNamedPipe(pipe_, NULL))
           return;
-        wprintf(L"registration intiated\n");
         DWORD read = 0;
         if (!::ReadFile(pipe_, &crb, sizeof(crb), &read, NULL))
           break;
         if (read != sizeof(crb))
           break;
         if (crb.pid < 8)
+          break;
+        DWORD real_pid = 0;
+        ::GetNamedPipeClientProcessId(pipe_, &real_pid);
+        if (crb.pid != real_pid)
           break;
         ClientRecord client(crb.pid);
         client.process = ::OpenProcess(PROCESS_ALL_ACCESS, FALSE, crb.pid);
@@ -181,21 +166,34 @@ public:
           if (!client.process)
             break;
         }
+
         CrashACKBlock cab;
-        cab.signal_event = event_thread_.GetEvent(client.process);
-        client.dump_done = ::CreateEvent(NULL, TRUE, FALSE, NULL);
-        if (!::DuplicateHandle(::GetCurrentProcess(), client.dump_done,
-                               client.process, &cab.wait_event,
-                               SYNCHRONIZE|EVENT_MODIFY_STATE, FALSE, 0))
+        client.dump_request = CreateAutoResetEvent();
+        client.dump_done = CreateAutoResetEvent();
+        cab.wait_event = DuplicateEvent(client.process, client.dump_done);
+        cab.signal_event = DuplicateEvent(client.process, client.dump_request);
+        if ((cab.wait_event == NULL) || (cab.signal_event == NULL))
           break;
+
         DWORD written = 0;
         if (!::WriteFile(pipe_, &cab, sizeof(cab), &written, NULL))
           break;
-        wprintf(L"client pid=%d registered\n", client.pid);
+
+        ::RegisterWaitForSingleObject(&client.dump_tpr,
+                                      client.dump_request,
+                                      &OnDumpEvent, new ClientRecord(client),
+                                      INFINITE, WT_EXECUTEDEFAULT);
+
+        ::RegisterWaitForSingleObject(&client.process_tpr,
+                                      client.process,
+                                      &OnDumpEvent, new ClientRecord(client),
+                                      INFINITE, WT_EXECUTEONLYONCE);
+
         clients_.emplace_back(client);
+        wprintf(L"client pid=%d registered\n", client.pid);
         break;
       }
-      wprintf(L"registration done. %d clients", clients_.size());
+      wprintf(L"registration done. %d registered client(s)\n", clients_.size());
       ::DisconnectNamedPipe(pipe_);
     }
   }

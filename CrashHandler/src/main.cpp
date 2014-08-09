@@ -85,7 +85,7 @@ CrashClient* CrashClient::global_client = nullptr;
 ///////////////////////////////////////////////////////////////////////////////
 
 HANDLE CreateAutoResetEvent() {
-  return ::CreateEvent(NULL, TRUE, FALSE, NULL);
+  return ::CreateEventW(NULL, FALSE, FALSE, NULL);
 }
 
 HANDLE DuplicateEvent(HANDLE process, HANDLE event) {
@@ -97,69 +97,86 @@ HANDLE DuplicateEvent(HANDLE process, HANDLE event) {
         handle : NULL;
 }
 
-class CrashService {
-  HANDLE pipe_;
-
-  struct ClientRecord {
-    DWORD pid;
-    HANDLE process;
-    HANDLE dump_done;
-    HANDLE dump_request;
-    HANDLE dump_tpr;
-    HANDLE process_tpr;
-    
-    ClientRecord(DWORD pid)
-      : pid(pid),
-        process(NULL),
-        dump_done(NULL),
-        dump_request(NULL),
-        dump_tpr(NULL),
-        process_tpr(NULL) {
-    }
-  };
-
-  std::vector<ClientRecord> clients_;
-
-  static void __stdcall OnDumpEvent(void* ctx, BOOLEAN) {
-
-  }
-
-  static void __stdcall OnProcessEnd(void* ctx, BOOLEAN) {
-
-  }
-  
+class CrashService {  
 public:
-  CrashService() {
-    pipe_ = ::CreateNamedPipe(kPipeName,
-        PIPE_ACCESS_DUPLEX|FILE_FLAG_FIRST_PIPE_INSTANCE,
-        PIPE_TYPE_MESSAGE|PIPE_READMODE_MESSAGE|PIPE_WAIT,
-        1,
-        512, 512,
-        20,
-        NULL);
+  CrashService(int pipe_instances) {
+    port_ = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
+
+    for (int ix = 0; ix != pipe_instances; ++ix) {
+      HANDLE pipe = ::CreateNamedPipe(kPipeName,
+          PIPE_ACCESS_DUPLEX,
+          PIPE_TYPE_MESSAGE|PIPE_READMODE_MESSAGE|PIPE_WAIT,
+          pipe_instances,
+          512, 512,
+          20,
+          NULL);
+      SvcContext* contex = new SvcContext(port_, pipe);
+      ::CreateThread(NULL, 0, &PipeServiceProc, contex, 0, NULL);
+    }
   }
+
+  CrashService(const CrashService&) = delete;
 
   void Run() {
+    OVERLAPPED* ov = nullptr;
+    ULONG_PTR key = 0;
+    DWORD bytes = 0;
+    int client_count = 0;
+    int dumps_taken = 0;
+
+    while (true) {
+      ::GetQueuedCompletionStatus(port_, &bytes, &key, &ov, INFINITE);
+      if (!key)
+        break;
+      ClientRecord* client = reinterpret_cast<ClientRecord*>(key);
+      switch (client->state) {
+        case kRegisterClient:
+          wprintf(L"client registered with pid=%d\n", client->pid);
+          ++client_count;
+          break;
+        case kUnRegisterClient:
+          ::UnregisterWait(client->dump_tpr);
+          ::UnregisterWait(client->process_tpr);
+          ::CloseHandle(client->dump_done);
+          ::CloseHandle(client->dump_request);
+          wprintf(L"client unregistered with pid=%d\n", client->pid);
+          --client_count;
+          break;
+        case kDumpready:
+          ++dumps_taken;
+          wprintf(L"client dump ready with pid=%d\n", client->pid);
+          break;
+        default:
+          __debugbreak();
+          break;
+      }
+      delete client;
+    }
+  }
+
+  static DWORD __stdcall PipeServiceProc(void* ctx) {
+    SvcContext* svc_context = reinterpret_cast<SvcContext*>(ctx);
+
     CrashRegistrationBlock crb;
     while (true) {
       while (true) {
-        if (!::ConnectNamedPipe(pipe_, NULL))
-          return;
+        if (!::ConnectNamedPipe(svc_context->pipe, NULL))
+          return 1;
         DWORD read = 0;
-        if (!::ReadFile(pipe_, &crb, sizeof(crb), &read, NULL))
+        if (!::ReadFile(svc_context->pipe, &crb, sizeof(crb), &read, NULL))
           break;
         if (read != sizeof(crb))
           break;
         if (crb.pid < 8)
           break;
         DWORD real_pid = 0;
-        ::GetNamedPipeClientProcessId(pipe_, &real_pid);
+        ::GetNamedPipeClientProcessId(svc_context->pipe, &real_pid);
         if (crb.pid != real_pid)
           break;
-        ClientRecord client(crb.pid);
+        ClientRecord client(svc_context->main_port, kRegisterClient, crb.pid);
         client.process = ::OpenProcess(PROCESS_ALL_ACCESS, FALSE, crb.pid);
         if (!client.process) {
-          if (!::ImpersonateNamedPipeClient(pipe_))
+          if (!::ImpersonateNamedPipeClient(svc_context->pipe))
             break;
           client.process = ::OpenProcess(PROCESS_ALL_ACCESS, FALSE, crb.pid);
           ::RevertToSelf();
@@ -176,8 +193,11 @@ public:
           break;
 
         DWORD written = 0;
-        if (!::WriteFile(pipe_, &cab, sizeof(cab), &written, NULL))
+        if (!::WriteFile(svc_context->pipe, &cab, sizeof(cab), &written, NULL))
           break;
+
+        ::PostQueuedCompletionStatus(
+            svc_context->main_port, 0, ULONG_PTR(new ClientRecord(client)), NULL);
 
         ::RegisterWaitForSingleObject(&client.dump_tpr,
                                       client.dump_request,
@@ -186,20 +206,74 @@ public:
 
         ::RegisterWaitForSingleObject(&client.process_tpr,
                                       client.process,
-                                      &OnDumpEvent, new ClientRecord(client),
+                                      &OnProcessEnd, new ClientRecord(client),
                                       INFINITE, WT_EXECUTEONLYONCE);
 
-        clients_.emplace_back(client);
-        wprintf(L"client pid=%d registered\n", client.pid);
         break;
       }
-      wprintf(L"registration done. %d registered client(s)\n", clients_.size());
-      ::DisconnectNamedPipe(pipe_);
+      ::DisconnectNamedPipe(svc_context->pipe);
     }
+    return 0;
   }
 
-  CrashService(const CrashService&) = delete;
+private:
+  enum State {
+    kRegisterClient,
+    kUnRegisterClient,
+    kDumpready,
+  };
 
+  struct ClientRecord {
+    HANDLE port;
+    State state;
+    DWORD pid;
+    HANDLE process;
+    HANDLE dump_done;
+    HANDLE dump_request;
+    HANDLE dump_tpr;
+    HANDLE process_tpr;
+    
+    ClientRecord(HANDLE port, State state, DWORD pid)
+      : port(port),
+        state(state),
+        pid(pid),
+        process(NULL),
+        dump_done(NULL),
+        dump_request(NULL),
+        dump_tpr(NULL),
+        process_tpr(NULL) {
+    }
+  };
+
+  struct SvcContext {
+    HANDLE main_port;
+    HANDLE pipe;
+
+    SvcContext(HANDLE main_port, HANDLE pipe)
+        : main_port(main_port), pipe(pipe) {
+    }
+  };
+
+  static void __stdcall OnDumpEvent(void* ctx, BOOLEAN) {
+    ClientRecord* client = reinterpret_cast<ClientRecord*>(ctx);
+    client->state = kDumpready;
+    
+    // Capture event here.
+    ::Sleep(10);
+    ::SetEvent(client->dump_done);
+
+    ::PostQueuedCompletionStatus(
+        client->port, 0, ULONG_PTR(client), NULL);
+  }
+
+  static void __stdcall OnProcessEnd(void* ctx, BOOLEAN) {
+    ClientRecord* client = reinterpret_cast<ClientRecord*>(ctx);
+    client->state = kUnRegisterClient;
+    ::PostQueuedCompletionStatus(
+        client->port, 0, ULONG_PTR(client), NULL);
+  }
+
+  HANDLE port_;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -228,7 +302,7 @@ int Client() {
 
 int Server() {
   wprintf(L"crash server\n");
-  CrashService crash_service;
+  CrashService crash_service(2);
   crash_service.Run();
   return 0;
 }

@@ -1,3 +1,30 @@
+//////////////////////////////////////////////////////////////////////////
+// This is a proof of concept for a new crash handler client for windows
+// based on the experience with google's breakpad. 
+//
+// Just like breakpad out-of-process mode, there basic operation
+// is based on named pipes and has an initial phase or registration
+// between client and server, later possibly a dump request event
+// and eventually a end-of-life event for the client.
+//
+// Also like breakpad the request of a dump is based on signaling
+// an event and wait on another, these obtained during the registration
+// phase.
+//
+// It is meant to be better than breakpad in a number of areas:
+// Server:
+// 1- Stateless design. There is no central list of registered clients
+//    and the resulting mass of code and overhead of lookup/add/removal.
+//    All the state is implicitly mantained by the windows thread pool.
+// 2- Multi-threaded. Servicing the registrations over the pipe is done
+//    by multiple threads, speeding up the registration greatly.
+// 3- Synchronous pipe operations. Both faster and the resulting code
+//    is simpler than breakpad.
+// 4- Clean theadpool handles management. In breakpad we never got a
+//    handle on the right way or time to call UnregisterWait(). This
+//    version gets it right.
+//
+
 #include <SDKDDKVer.h>
 
 #include <stdio.h>
@@ -36,18 +63,12 @@ struct CrashACKBlock {
 };
 
 class CrashClient {
-  MINIDUMP_EXCEPTION_INFORMATION mexinfo_;
-  CrashRegistrationBlock crb_;
-  CrashACKBlock cab_;
-  
-  static CrashClient* global_client;
-
 public:
   CrashClient() {
     crb_.pid = ::GetCurrentProcessId();
     crb_.tid = ::GetCurrentThreadId();
     crb_.mex = &mexinfo_;
-    // Async registration.
+    // Async registration. Not sure this is a good idea.
     ::QueueUserWorkItem(&Register, this, 0);
     global_client = this;
   }
@@ -58,6 +79,8 @@ private:
   static DWORD __stdcall Register(void* ctx) {
     CrashClient* client = reinterpret_cast< CrashClient*>(ctx);
     DWORD read = 0;
+    // CallNamedPipe has the disadvantage that the token can be stolen
+    // if an adversary is squating on the named pipe.
     if (::CallNamedPipe(kPipeName,
                         &client->crb_, sizeof(client->crb_),
                         &client->cab_, sizeof(client->cab_),
@@ -78,6 +101,12 @@ private:
     ::SignalObjectAndWait(cab.signal_event, cab.wait_event, 20000, FALSE);
     return EXCEPTION_EXECUTE_HANDLER;
   }
+
+  MINIDUMP_EXCEPTION_INFORMATION mexinfo_;
+  CrashRegistrationBlock crb_;
+  CrashACKBlock cab_;
+  
+  static CrashClient* global_client;
 };
 
 CrashClient* CrashClient::global_client = nullptr;
@@ -170,6 +199,7 @@ public:
         if (crb.pid < 8)
           break;
         DWORD real_pid = 0;
+        // The next function is only available in Vista+.
         ::GetNamedPipeClientProcessId(svc_context->pipe, &real_pid);
         if (crb.pid != real_pid)
           break;
@@ -184,9 +214,10 @@ public:
             break;
         }
 
-        CrashACKBlock cab;
         client.dump_request = CreateAutoResetEvent();
         client.dump_done = CreateAutoResetEvent();
+
+        CrashACKBlock cab;
         cab.wait_event = DuplicateEvent(client.process, client.dump_done);
         cab.signal_event = DuplicateEvent(client.process, client.dump_request);
         if ((cab.wait_event == NULL) || (cab.signal_event == NULL))
@@ -258,7 +289,7 @@ private:
     ClientRecord* client = reinterpret_cast<ClientRecord*>(ctx);
     client->state = kDumpready;
     
-    // Capture event here.
+    // Capture dump here and write it to disk now.
     ::Sleep(10);
     ::SetEvent(client->dump_done);
 

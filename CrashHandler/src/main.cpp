@@ -62,6 +62,37 @@ struct CrashACKBlock {
   }
 };
 
+// Takes care of using SECURITY_IDENTIFICATION so the pipes server cannot
+// impersonate us.
+bool SafeCallNamedPipe(
+  const wchar_t* name,
+  void* send, DWORD send_size,
+  void* recv, DWORD recv_size,
+  DWORD* read, int retries) {
+  HANDLE pipe;
+  while (true) {
+    pipe = ::CreateFile(
+        name,
+        GENERIC_READ | GENERIC_WRITE,
+        0, 
+        NULL,
+        OPEN_EXISTING,
+        SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+        NULL);
+    if (pipe != INVALID_HANDLE_VALUE)
+      break;
+    if (!retries) {
+      return false;
+    } else {
+      --retries;
+      ::Sleep(10);
+    }
+  }
+  DWORD mode = PIPE_READMODE_MESSAGE;
+  ::SetNamedPipeHandleState(pipe, &mode, NULL, NULL);
+  return  TRUE == ::TransactNamedPipe(pipe, send, send_size, recv, recv_size, read, NULL);
+}
+
 class CrashClient {
 public:
   CrashClient() {
@@ -81,10 +112,10 @@ private:
     DWORD read = 0;
     // CallNamedPipe has the disadvantage that the token can be stolen
     // if an adversary is squating on the named pipe.
-    if (::CallNamedPipe(kPipeName,
+    if (SafeCallNamedPipe(kPipeName,
                         &client->crb_, sizeof(client->crb_),
                         &client->cab_, sizeof(client->cab_),
-                        &read, 200000)) {
+                        &read, 3)) {
       if (client->cab_.signal_event && client->cab_.wait_event)
         ::SetUnhandledExceptionFilter(ExHandler);
     }
@@ -189,8 +220,9 @@ public:
     CrashRegistrationBlock crb;
     while (true) {
       while (true) {
-        if (!::ConnectNamedPipe(svc_context->pipe, NULL))
-          return 1;
+        // Connect can return false if the client connects before we get here.
+        // Best bet is to just try to read from the pipe.
+        ::ConnectNamedPipe(svc_context->pipe, NULL);
         DWORD read = 0;
         if (!::ReadFile(svc_context->pipe, &crb, sizeof(crb), &read, NULL))
           break;
